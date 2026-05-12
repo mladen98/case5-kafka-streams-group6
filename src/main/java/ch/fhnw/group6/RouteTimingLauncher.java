@@ -1,75 +1,65 @@
 package ch.fhnw.group6;
 
-import org.apache.kafka.clients.consumer.ConsumerRecord;
-import org.apache.kafka.clients.consumer.ConsumerRecords;
-import org.apache.kafka.clients.consumer.KafkaConsumer;
-import org.apache.kafka.clients.producer.KafkaProducer;
-import org.apache.kafka.clients.producer.ProducerRecord;
-import org.apache.kafka.common.TopicPartition;
-import org.apache.kafka.streams.KeyValue;
+import org.apache.kafka.clients.consumer.ConsumerConfig;
+import org.apache.kafka.common.serialization.Serdes;
+import org.apache.kafka.streams.KafkaStreams;
+import org.apache.kafka.streams.StreamsBuilder;
+import org.apache.kafka.streams.StreamsConfig;
+import org.apache.kafka.streams.Topology;
+import org.apache.kafka.streams.kstream.KStream;
+import org.apache.kafka.streams.processor.WallclockTimestampExtractor;
 
-import java.time.Duration;
-import java.util.Collections;
-import java.util.List;
 import java.util.Properties;
+import java.util.concurrent.CountDownLatch;
 
 public class RouteTimingLauncher {
 
     public static void main(String[] args) {
 
-        // Consumer-Konfiguration (Plain KafkaConsumer – kein Kafka Streams, kein REBALANCING)
-        Properties consumerProps = new Properties();
-        consumerProps.put("bootstrap.servers", "192.168.111.10:9092");
-        consumerProps.put("key.deserializer", "org.apache.kafka.common.serialization.StringDeserializer");
-        consumerProps.put("value.deserializer", "org.apache.kafka.common.serialization.StringDeserializer");
-        consumerProps.put("auto.offset.reset", "latest");
+        Properties props = new Properties();
+        props.put(StreamsConfig.APPLICATION_ID_CONFIG, "route-timing-group6-v1");
+        props.put(StreamsConfig.BOOTSTRAP_SERVERS_CONFIG, "192.168.111.10:9092");
+        props.put(StreamsConfig.DEFAULT_KEY_SERDE_CLASS_CONFIG, Serdes.String().getClass());
+        props.put(StreamsConfig.DEFAULT_VALUE_SERDE_CLASS_CONFIG, Serdes.String().getClass());
+        props.put(StreamsConfig.DEFAULT_TIMESTAMP_EXTRACTOR_CLASS_CONFIG, WallclockTimestampExtractor.class);
+        props.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "latest");
 
-        // Producer-Konfiguration
-        Properties producerProps = new Properties();
-        producerProps.put("bootstrap.servers", "192.168.111.10:9092");
-        producerProps.put("key.serializer", "org.apache.kafka.common.serialization.StringSerializer");
-        producerProps.put("value.serializer", "org.apache.kafka.common.serialization.StringSerializer");
+        StreamsBuilder builder = new StreamsBuilder();
 
-        KafkaConsumer<String, String> consumer = new KafkaConsumer<>(consumerProps);
-        KafkaProducer<String, String> producer = new KafkaProducer<>(producerProps);
+        KStream<String, String> source = builder.stream("driver-position");
 
-        // Manuelle Partition-Zuweisung → kein Group-Coordinator, kein REBALANCING
-        TopicPartition partition = new TopicPartition("driver-position", 0);
-        List<TopicPartition> partitions = Collections.singletonList(partition);
-        consumer.assign(partitions);
+        source.map(new RouteTimingMapper())
+                .filter((key, value) -> value != null)
+                .to("group6-route-timing");
 
-        // Nur neue Nachrichten lesen (nicht 2.3 Mio. alte)
-        consumer.seekToEnd(partitions);
+        Topology topology = builder.build();
+        System.out.println(topology.describe());
 
-        System.out.println("App 1 (RouteTimingLauncher) gestartet.");
-        System.out.println("Liest von:   driver-position (Partition 0, ab Ende)");
-        System.out.println("Schreibt in: group6-route-timing");
-        System.out.println("Warte auf neue GPS-Events ...");
+        KafkaStreams streams = new KafkaStreams(topology, props);
+        CountDownLatch latch = new CountDownLatch(1);
 
-        RouteTimingMapper mapper = new RouteTimingMapper();
-        long processedCount = 0;
+        streams.setStateListener((newState, oldState) ->
+                System.out.println("STREAM STATE: " + oldState + " -> " + newState)
+        );
 
-        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
-            System.out.println("Shutdown: " + processedCount + " Events verarbeitet.");
-            producer.flush();
-            producer.close();
-        }));
-
-        while (true) {
-            ConsumerRecords<String, String> records = consumer.poll(Duration.ofMillis(500));
-
-            for (ConsumerRecord<String, String> record : records) {
-                try {
-                    KeyValue<String, String> result = mapper.apply(record.key(), record.value());
-
-                    if (result.value != null) {
-                        producer.send(new ProducerRecord<>("group6-route-timing", result.key, result.value));
-                        System.out.println("→ Geschrieben nach group6-route-timing: " + result.value);
-                    }
-                } catch (Exception e) {
-                    System.err.println("Fehler beim Verarbeiten von Record key=" + record.key() + ": " + e.getMessage());
-                }
+        Runtime.getRuntime().addShutdownHook(new Thread("shutdown-hook") {
+            @Override
+            public void run() {
+                streams.close();
+                latch.countDown();
             }
+        });
+
+        try {
+            streams.start();
+            System.out.println("App 1 (RouteTimingLauncher) gestartet.");
+            System.out.println("Liest von:   driver-position");
+            System.out.println("Schreibt in: group6-route-timing");
+            latch.await();
+        } catch (Throwable e) {
+            e.printStackTrace();
+            System.exit(1);
         }
+        System.exit(0);
     }
 }

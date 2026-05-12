@@ -1,113 +1,64 @@
 package ch.fhnw.group6;
 
-import org.apache.kafka.clients.consumer.*;
-import org.apache.kafka.clients.producer.*;
-import org.apache.kafka.common.PartitionInfo;
-import org.apache.kafka.common.TopicPartition;
-import org.apache.kafka.common.errors.WakeupException;
-import org.apache.kafka.common.serialization.StringDeserializer;
-import org.apache.kafka.common.serialization.StringSerializer;
+import org.apache.kafka.common.serialization.Serdes;
+import org.apache.kafka.streams.KafkaStreams;
+import org.apache.kafka.streams.StreamsBuilder;
+import org.apache.kafka.streams.StreamsConfig;
+import org.apache.kafka.streams.Topology;
+import org.apache.kafka.streams.kstream.KStream;
+import org.apache.kafka.streams.processor.WallclockTimestampExtractor;
 
-import java.time.Duration;
-import java.util.*;
+import java.util.Properties;
+import java.util.concurrent.CountDownLatch;
 
-/**
- * App 2 – Step 3 + 4
- *
- * Liest Timing-Events aus "group2-route-timing",
- * filtert Verspätungen > 180 Sekunden (Step 3)
- * und schreibt diese ins Dashboard-Topic "delays" (Step 4).
- *
- * Verwendet plain KafkaConsumer statt Kafka Streams (robuster).
- */
 public class DelaydetectorLauncher {
 
-    public static void main(String[] args) throws Exception {
+    public static void main(String[] args) {
 
-        // ── Consumer ────────────────────────────────────────────────────────
-        Properties consumerProps = new Properties();
-        consumerProps.put("bootstrap.servers", "192.168.111.10:9092");
-        consumerProps.put("group.id", "delay-detector-group6-v1");
-        consumerProps.put("key.deserializer", StringDeserializer.class.getName());
-        consumerProps.put("value.deserializer", StringDeserializer.class.getName());
-        consumerProps.put("enable.auto.commit", "true");
-        consumerProps.put("auto.offset.reset", "earliest");
+        Properties props = new Properties();
+        props.put(StreamsConfig.APPLICATION_ID_CONFIG, "delay-detector-group6-v1");
+        props.put(StreamsConfig.BOOTSTRAP_SERVERS_CONFIG, "192.168.111.10:9092");
+        props.put(StreamsConfig.DEFAULT_KEY_SERDE_CLASS_CONFIG, Serdes.String().getClass());
+        props.put(StreamsConfig.DEFAULT_VALUE_SERDE_CLASS_CONFIG, Serdes.String().getClass());
+        props.put(StreamsConfig.DEFAULT_TIMESTAMP_EXTRACTOR_CLASS_CONFIG, WallclockTimestampExtractor.class);
 
-        // ── Producer ─────────────────────────────────────────────────────────
-        Properties producerProps = new Properties();
-        producerProps.put("bootstrap.servers", "192.168.111.10:9092");
-        producerProps.put("key.serializer", StringSerializer.class.getName());
-        producerProps.put("value.serializer", StringSerializer.class.getName());
+        StreamsBuilder builder = new StreamsBuilder();
 
-        KafkaConsumer<String, String> consumer = new KafkaConsumer<>(consumerProps);
-        KafkaProducer<String, String> producer = new KafkaProducer<>(producerProps);
+        KStream<String, String> source = builder.stream("group6-route-timing");
 
-        // Partitionen manuell zuweisen (kein Group-Rebalancing nötig)
-        List<PartitionInfo> partitionInfos = consumer.partitionsFor("group6-route-timing");
-        if (partitionInfos == null || partitionInfos.isEmpty()) {
-            System.out.println("FEHLER: Topic 'group6-route-timing' nicht gefunden!");
-            consumer.close();
-            producer.close();
-            return;
-        }
-        List<TopicPartition> partitions = new ArrayList<>();
-        for (PartitionInfo pi : partitionInfos) {
-            partitions.add(new TopicPartition("group6-route-timing", pi.partition()));
-        }
-        consumer.assign(partitions);
+        source.filter(new DelayFilter())
+                .peek(new MyProcessor())
+                .to("delays");
 
-        // Aktuellen End-Offset ermitteln und von dort starten
-        // (nicht seekToBeginning - das würde 900+ alte Messages auf einmal in delays schreiben)
-        Map<TopicPartition, Long> endOffsets = consumer.endOffsets(partitions);
-        for (Map.Entry<TopicPartition, Long> e : endOffsets.entrySet()) {
-            consumer.seek(e.getKey(), e.getValue());
-            System.out.println("Starte ab Offset " + e.getValue() + " für Partition " + e.getKey().partition());
-        }
+        Topology topology = builder.build();
+        System.out.println(topology.describe());
 
-        System.out.println("App 2 (DelayDetectorLauncher) gestartet.");
-        System.out.println("Liest von:   group6-route-timing (nur neue Events ab jetzt)");
-        System.out.println("Schreibt in: delays  (Format: id: X, delay: Y)");
-        System.out.println("Dashboard:   http://192.168.111.11:8080/status/");
-        System.out.println("Warte auf Nachrichten...");
+        KafkaStreams streams = new KafkaStreams(topology, props);
+        CountDownLatch latch = new CountDownLatch(1);
 
-        // Shutdown-Hook: wakeup() unterbricht consumer.poll() sicher im Main-Thread
-        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
-            System.out.println("App 2 wird gestoppt...");
-            consumer.wakeup();   // ← thread-sicher; wirft WakeupException in poll()
-        }));
+        streams.setStateListener((newState, oldState) ->
+                System.out.println("STREAM STATE: " + oldState + " -> " + newState)
+        );
 
-        DelayFilter filter = new DelayFilter();
-        MyProcessor processor = new MyProcessor();
+        Runtime.getRuntime().addShutdownHook(new Thread("shutdown-hook") {
+            @Override
+            public void run() {
+                streams.close();
+                latch.countDown();
+            }
+        });
 
         try {
-            while (true) {
-                ConsumerRecords<String, String> records = consumer.poll(Duration.ofMillis(500));
-                for (ConsumerRecord<String, String> record : records) {
-                    String key = record.key();
-                    String value = record.value();
-
-                    // Stage 2: Filter
-                    boolean significant = filter.test(key, value);
-
-                    if (significant) {
-                        // Stage 3: Peek (Logging)
-                        processor.apply(key, value);
-
-                        // Stage 4: In delays-Topic schreiben
-                        // Dashboard erwartet Format: "id: 123, delay: 321"
-                        // value enthält bereits dieses Format aus group6-route-timing
-                        producer.send(new ProducerRecord<>("delays", key, value));
-                        System.out.println("✅ In 'delays' geschrieben: key=" + key + " value=" + value);
-                    }
-                }
-            }
-        } catch (WakeupException e) {
-            // Normales Shutdown-Signal – ignorieren
-        } finally {
-            // Consumer und Producer werden jetzt im Main-Thread geschlossen (thread-sicher)
-            consumer.close();
-            producer.close();
-            System.out.println("App 2 gestoppt.");
+            streams.start();
+            System.out.println("App 2 (DelaydetectorLauncher) gestartet.");
+            System.out.println("Liest von:   group6-route-timing");
+            System.out.println("Schreibt in: delays");
+            System.out.println("Dashboard:   http://192.168.111.11:8080/status/");
+            latch.await();
+        } catch (Throwable e) {
+            e.printStackTrace();
+            System.exit(1);
         }
+        System.exit(0);
     }
 }
